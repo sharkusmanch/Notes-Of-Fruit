@@ -36,8 +36,20 @@ jobs:
             echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build release APK
-        run: ./gradlew :app:assembleRelease --no-daemon
+      - name: Build signed release APK
+        env:
+          SIGNING_KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+        run: |
+          if [ -z "$SIGNING_KEYSTORE_B64" ] || [ -z "$SIGNING_STORE_PASSWORD" ] || [ -z "$SIGNING_KEY_ALIAS" ]; then
+            echo "::error::Signing secrets are missing"
+            exit 1
+          fi
+          export SIGNING_KEYSTORE_FILE="$RUNNER_TEMP/release.p12"
+          (umask 077 && printf '%s' "$SIGNING_KEYSTORE_B64" | base64 --decode > "$SIGNING_KEYSTORE_FILE")
+          trap 'rm -f "$SIGNING_KEYSTORE_FILE"' EXIT
+          ./gradlew --no-daemon --console=plain :app:testDebugUnitTest :app:assembleRelease
 
       - name: Rename APK
         run: |
@@ -74,6 +86,5 @@ jobs:
             to enable "Install unknown apps" for your file manager / browser).
             Min Android version: 8.0 (API 26).
 
-            The APK is signed with the project's debug keystore — Play Store
-            distribution will require a real keystore rotation in a future
-            release.
+            The APK is signed with this fork's own key, so it installs beside
+            the upstream app rather than over it.

@@ -8,29 +8,27 @@ android {
     namespace = "com.example.applenotes"
     compileSdk = 36
     defaultConfig {
-        applicationId = "com.example.applenotes"
+        // Fork ID so this build installs beside upstream's com.example.applenotes.
+        // The namespace (and so every package) is unchanged.
+        applicationId = "io.github.sharkusmanch.notesoffruit"
         minSdk = 26
         targetSdk = 36
         versionCode = 2
         versionName = "0.0.2"
     }
 
-    signingConfigs {
-        // Stable project-owned keystore so every release-tagged build is
-        // signed with the SAME key. Without this, GH Actions generates a
-        // fresh ~/.android/debug.keystore per runner and users can't upgrade
-        // across releases (Android rejects an APK update with a different
-        // signing certificate).
-        //
-        // Password is committed alongside the keystore on purpose — this is
-        // an alpha self-signed cert, not a Play Store key. Anyone who can
-        // pull the repo can rebuild & sign their own APK; that's the
-        // expected level of trust for a research project.
-        create("releaseAlpha") {
-            storeFile = file("keystore/release.keystore")
-            storePassword = "notesoffruit"
-            keyAlias = "notes-of-fruit"
-            keyPassword = "notesoffruit"
+    // CI signing, read from the environment. One stable key signs debug and release so
+    // every build installs over the previous one; a fresh debug key per runner would not.
+    // Absent → release is unsigned and debug uses the local debug key.
+    val ciStoreFile: String = System.getenv("SIGNING_KEYSTORE_FILE").orEmpty()
+    if (ciStoreFile.isNotBlank()) {
+        signingConfigs {
+            create("ci") {
+                storeFile = file(ciStoreFile)
+                storePassword = System.getenv("SIGNING_STORE_PASSWORD")
+                keyAlias = System.getenv("SIGNING_KEY_ALIAS")
+                keyPassword = System.getenv("SIGNING_STORE_PASSWORD")
+            }
         }
     }
 
@@ -38,7 +36,14 @@ android {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = signingConfigs.getByName("releaseAlpha")
+            if (ciStoreFile.isNotBlank()) {
+                signingConfig = signingConfigs.getByName("ci")
+            }
+        }
+        debug {
+            if (ciStoreFile.isNotBlank()) {
+                signingConfig = signingConfigs.getByName("ci")
+            }
         }
     }
     compileOptions {

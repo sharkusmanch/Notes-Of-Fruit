@@ -1,0 +1,82 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Decode signing keystore
+        id: keystore
+        env:
+          SIGNING_KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$SIGNING_KEYSTORE_B64" ]; then
+            (umask 077 && printf '%s' "$SIGNING_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/signing.p12")
+            echo "file=$RUNNER_TEMP/signing.p12" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Test and build
+        env:
+          SIGNING_KEYSTORE_FILE: ${{ steps.keystore.outputs.file }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+        run: ./gradlew --no-daemon --console=plain :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
+
+      # Debug and release are signed with the same key, so either installs
+      # over the other on the owner's phone.
+      - name: Verify the signing key was used
+        if: steps.keystore.outputs.file != ''
+        env:
+          EXPECTED_CERT_SHA256: ${{ vars.SIGNING_CERT_SHA256 }}
+        run: |
+          apksigner="$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)"
+          for apk in app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/release/app-release.apk; do
+            actual=$("$apksigner" verify --print-certs "$apk" | sed -n 's/^.*certificate SHA-256 digest: //p' | sort -u)
+            echo "$apk: $actual"
+            [ "$actual" = "$EXPECTED_CERT_SHA256" ]
+          done
+
+      # The debug receiver can rewrite and delete notes; it must never ship.
+      - name: Release build has no debug receiver
+        run: |
+          aapt2="$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -1)"
+          "$aapt2" dump xmltree --file AndroidManifest.xml app/build/outputs/apk/release/app-release.apk > manifest.txt
+          if grep -q "DebugReceiver" manifest.txt; then
+            echo "::error::DebugReceiver is present in the release APK"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports
+          path: app/build/reports
+          if-no-files-found: ignore
