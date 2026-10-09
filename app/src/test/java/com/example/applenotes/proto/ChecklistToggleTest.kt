@@ -100,6 +100,60 @@ class ChecklistToggleTest {
         val changed = origRuns.indices.filter { !origRuns[it].payload.contentEquals(newRuns[it].payload) }
         assertEquals(1, changed.size)
         assertArrayEquals(todoUuid(origRuns[changed[0]]), todoUuid(newRuns[changed[0]]))
+
+        // Inside that run only the done flag differs.
+        val before = ProtobufWire.decode(origRuns[changed[0]].payload)
+        val after = ProtobufWire.decode(newRuns[changed[0]].payload)
+        assertSameFieldsExcept(before, after, 2)
+        val styleBefore = ProtobufWire.decode(before.first { it.fieldNumber == 2 }.payload)
+        val styleAfter = ProtobufWire.decode(after.first { it.fieldNumber == 2 }.payload)
+        assertSameFieldsExcept(styleBefore, styleAfter, 5)
+        val todoAfter = ProtobufWire.decode(styleAfter.first { it.fieldNumber == 5 }.payload)
+        assertEquals(listOf(1, 2), todoAfter.map { it.fieldNumber })
+        assertEquals(1L, ProtobufWire.decodeVarint(todoAfter[1]))
+
+        // Nothing outside the note message moved either.
+        assertSameFieldsExcept(ProtobufWire.decode(orig), ProtobufWire.decode(new), 2)
+        val docBefore = ProtobufWire.decode(ProtobufWire.decode(orig).first { it.fieldNumber == 2 }.payload)
+        val docAfter = ProtobufWire.decode(ProtobufWire.decode(new).first { it.fieldNumber == 2 }.payload)
+        assertSameFieldsExcept(docBefore, docAfter, 3)
+    }
+
+    /** Same fields in the same order, byte for byte, apart from field [except]. */
+    private fun assertSameFieldsExcept(a: List<ProtobufWire.Field>, b: List<ProtobufWire.Field>, except: Int) {
+        assertEquals(a.map { it.fieldNumber }, b.map { it.fieldNumber })
+        for ((x, y) in a.zip(b)) {
+            if (x.fieldNumber != except) assertArrayEquals("field ${x.fieldNumber}", x.payload, y.payload)
+        }
+    }
+
+    /**
+     * Apple's own apps stamp runs with field 13. A run we change loses its
+     * stamp (iCloud.com writes runs without one); every other run keeps it.
+     */
+    @Test
+    fun onlyTheChangedRunLosesItsStamp() {
+        val orig = loadProtoBytes()
+        val fields = noteFields(orig).toMutableList()
+        for (i in fields.indices) {
+            if (fields[i].fieldNumber != 5) continue
+            val run = ProtobufWire.decode(fields[i].payload)
+            run.add(ProtobufWire.encodeVarintField(13, 700_000_000L + i))
+            fields[i] = fields[i].copy(payload = ProtobufWire.encode(run))
+        }
+        val stamped = withNoteFields(orig, fields)
+        val stampedB64 = b64(stamped)
+        val text = NoteBodyEditor.readVisibleTextFromBase64(stampedB64)!!
+        val (first, _) = itemStarts(NoteBodyEditor.parseAttributeRuns(stamped))
+
+        val new = proto(ChecklistToggle.applyBase64(stampedB64, text, mapOf(first to true))!!)
+
+        val origRuns = runs(stamped)
+        val newRuns = runs(new)
+        val changed = origRuns.indices.filter { !origRuns[it].payload.contentEquals(newRuns[it].payload) }
+        assertEquals(1, changed.size)
+        assertTrue(ProtobufWire.decode(newRuns[changed[0]].payload).none { it.fieldNumber == 13 })
+        assertEquals(origRuns.size - 1, newRuns.count { r -> ProtobufWire.decode(r.payload).any { it.fieldNumber == 13 } })
     }
 
     @Test
@@ -190,6 +244,47 @@ class ChecklistToggleTest {
         assertArrayEquals(todoUuid(runs(damaged).first { todoUuid(it) != null }), todoUuid(items[0]))
         assertNotEquals(todoUuid(items[0])!!.toList(), todoUuid(items[1])!!.toList())
         assertEquals(text.length, runs(proto(newB64)).sumOf { runLength(it) })
+    }
+
+    /**
+     * When the stored text holds something our walk of the substring tree
+     * does not see, the screen is not showing the real note and its offsets
+     * cannot be trusted.
+     */
+    @Test
+    fun refusesANoteWhoseStoredTextDisagreesWithItsSubstringTree() {
+        val orig = loadProtoBytes()
+        val fields = noteFields(orig).toMutableList()
+        val textIdx = fields.indexOfFirst { it.fieldNumber == 2 }
+        fields[textIdx] = fields[textIdx].copy(
+            payload = (fields[textIdx].payload.decodeToString() + "unseen").encodeToByteArray(),
+        )
+        val oddB64 = b64(withNoteFields(orig, fields))
+        val text = NoteBodyEditor.readVisibleTextFromBase64(oddB64)!!
+        val (first, _) = itemStarts(NoteBodyEditor.parseAttributeRunsFromBase64(oddB64))
+
+        assertNull(ChecklistToggle.applyBase64(oddB64, text, mapOf(first to true)))
+    }
+
+    /** A run that already has the wanted state is not split just because it covers two items. */
+    @Test
+    fun aRunCoveringTwoItemsIsLeftAloneWhenNothingChanges() {
+        val orig = loadProtoBytes()
+        val fields = noteFields(orig).toMutableList()
+        val runIdxs = fields.indices.filter { fields[it].fieldNumber == 5 }
+        val firstIdx = runIdxs.first { todoUuid(fields[it]) != null }
+        val secondIdx = runIdxs[runIdxs.indexOf(firstIdx) + 1]
+        val firstLen = runLength(fields[firstIdx])
+        val merged = ProtobufWire.decode(fields[firstIdx].payload)
+        merged[merged.indexOfFirst { it.fieldNumber == 1 }] =
+            ProtobufWire.encodeVarintField(1, (firstLen + runLength(fields[secondIdx])).toLong())
+        fields[firstIdx] = fields[firstIdx].copy(payload = ProtobufWire.encode(merged))
+        fields.removeAt(secondIdx)
+        val damagedB64 = b64(withNoteFields(orig, fields))
+        val text = NoteBodyEditor.readVisibleTextFromBase64(damagedB64)!!
+        val first = itemStarts(NoteBodyEditor.parseAttributeRunsFromBase64(damagedB64)).single()
+
+        assertSame(damagedB64, ChecklistToggle.applyBase64(damagedB64, text, mapOf(first + firstLen to false)))
     }
 
     /**

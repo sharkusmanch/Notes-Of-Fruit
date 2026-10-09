@@ -21,6 +21,7 @@ import kotlin.io.encoding.ExperimentalEncodingApi
 object ChecklistToggle {
     private const val FIELD_NOTESTOREPROTO_DOCUMENT = 2
     private const val FIELD_DOCUMENT_NOTE = 3
+    private const val FIELD_NOTE_TEXT = 2
     private const val FIELD_NOTE_ATTRIBUTE_RUN = 5
     private const val FIELD_AR_LENGTH = 1
     private const val FIELD_AR_STYLE = 2
@@ -38,7 +39,8 @@ object ChecklistToggle {
      *
      * Returns the new `TextDataEncrypted`, or [textDataEncryptedB64] itself
      * when every item is already in the wanted state. Returns null when the
-     * note's text is no longer [expectedText] or an offset is not inside a
+     * note's text is no longer [expectedText], when the note's stored text
+     * and its substring tree disagree, or when an offset is not inside a
      * checklist item: the offsets then say nothing about this note.
      */
     fun applyBase64(
@@ -70,6 +72,15 @@ object ChecklistToggle {
         if (noteIdx < 0) return null
         val noteFields = ProtobufWire.decode(docFields[noteIdx].payload)
 
+        // The attribute runs are measured against the note's stored text. If
+        // our walk of the substring tree reads anything else, the offsets
+        // below would land in the wrong runs — refuse rather than tick the
+        // wrong item.
+        val storedText = noteFields
+            .firstOrNull { it.fieldNumber == FIELD_NOTE_TEXT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM }
+            ?.payload?.decodeToString()
+        if (storedText != raw) return null
+
         // One piece per attribute run to begin with; a run that covers more
         // than the item being changed is cut into pieces below.
         val pieces = ArrayList<Piece>()
@@ -99,8 +110,10 @@ object ChecklistToggle {
                     i++
                     continue
                 }
-                // The run also covers a neighbouring item: cut this item out
-                // of it and give the cut-out part an id of its own.
+                // The run also covers a neighbouring item. Nothing to do if
+                // it already has the wanted state; otherwise cut this item
+                // out of it and give the cut-out part an id of its own.
+                if (p.done == checked) { i++; continue }
                 val cutStart = maxOf(p.start, itemStart)
                 val cutEnd = minOf(p.end, itemEnd)
                 val uuid = newUuid ?: randomUuidBytes().also { newUuid = it }

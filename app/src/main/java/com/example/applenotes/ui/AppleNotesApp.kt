@@ -313,23 +313,28 @@ fun AppleNotesApp() {
      * at a time, until nothing the user tapped is unsaved. The screen only
      * moves to the saved note once the queue is empty.
      */
-    suspend fun saveChecklist(queue: ChecklistQueue, s: ScreenState.Detail) {
+    suspend fun saveChecklist(queue: ChecklistQueue, session: ICloudSession) {
         activeSaves++
-        var record = s.record
+        // The note as it is on screen now. Not the copy the tapped lambda
+        // captured: that one is a save behind if the tap lands in the frame
+        // after the previous drain.
+        var record = (state as? ScreenState.Detail)?.record
+            ?.takeIf { it.recordName == queue.recordName }
         try {
-            val client = AppleNotesClient(httpClient, s.session)
+            record ?: error("The note is no longer open.")
+            val client = AppleNotesClient(httpClient, session)
             // The offsets in the queue refer to the text of the note on screen.
-            val expectedText = record.stringField("TextDataEncrypted")
+            val expectedText = record?.stringField("TextDataEncrypted")
                 ?.let { NoteBodyEditor.readVisibleTextFromBase64(it) }
                 ?: error("No body field on this note.")
             val saved = HashMap<Int, Boolean>()
             while (true) {
                 val todo = queue.pending.filter { (pos, checked) -> saved[pos] != checked }
                 if (todo.isEmpty()) break
-                val base = record
+                val base = record ?: error("The note is no longer open.")
                 val baseB64 = base.stringField("TextDataEncrypted") ?: error("No body field on this note.")
                 val newB64 = ChecklistToggle.applyBase64(baseB64, expectedText, todo)
-                    ?: throw NoteChangedRemotelyException(base)
+                    ?: error("this note can't be ticked safely from here yet.")
                 if (newB64 != baseB64) {
                     record = saveMutex.withLock {
                         client.modifyNoteBody(
@@ -347,21 +352,23 @@ fun AppleNotesApp() {
                 saved.putAll(todo)
             }
             queue.pending.clear()
-            showRecord(record)
+            record?.let { showRecord(it) }
             lastSavedAtMs = System.currentTimeMillis()
         } catch (e: CancellationException) {
             throw e
-        } catch (e: NoteChangedRemotelyException) {
-            Log.w(TAG, "checklist save: note changed remotely; showing the fresh copy")
-            queue.pending.clear()
-            showRecord(e.fresh)
-            lastSavedHint = "This note changed on another device. Here is the latest — tap again."
         } catch (e: Throwable) {
             Log.e(TAG, "checklist save failed", e)
             // Drop the unsaved taps so the boxes show what iCloud really has.
             queue.pending.clear()
-            showRecord(record)
-            lastSavedHint = saveFailureMessage(e)
+            val onScreen = (state as? ScreenState.Detail)?.record?.recordName == queue.recordName
+            (if (e is NoteChangedRemotelyException) e.fresh else record)?.let { showRecord(it) }
+            lastSavedHint = when {
+                // The user has moved on; say which note the lost tap was in.
+                !onScreen -> "A checklist change in “${record?.decodedTitle().orEmpty()}” wasn't saved."
+                e is NoteChangedRemotelyException ->
+                    "This note changed on another device. Here is the latest — tap again."
+                else -> saveFailureMessage(e)
+            }
         } finally {
             activeSaves--
         }
@@ -404,6 +411,8 @@ fun AppleNotesApp() {
             },
         )
         is ScreenState.NotesList -> NotesListScreen(
+            hint = lastSavedHint,
+            onHintShown = { lastSavedHint = null },
             allNotes = s.notes,
             folders = s.folders,
             selectedFolder = s.selectedFolder,
@@ -414,7 +423,11 @@ fun AppleNotesApp() {
                 scope.launch {
                     state = ScreenState.Loading("Loading note…")
                     state = try {
-                        val rec = AppleNotesClient(httpClient, s.session).lookupNote(note.recordName)
+                        // Behind any save in flight, so we never show the
+                        // copy from just before it landed.
+                        val rec = saveMutex.withLock {
+                            AppleNotesClient(httpClient, s.session).lookupNote(note.recordName)
+                        }
                         ScreenState.Detail(s.session, rec, s.notes, s.folders, s.selectedFolder)
                     } catch (e: Throwable) {
                         ScreenState.Error(e.message ?: e.toString())
@@ -511,7 +524,7 @@ fun AppleNotesApp() {
                     ?: ChecklistQueue(s.record.recordName).also { checklistQueue = it }
                 queue.pending[paragraphStart] = checked
                 if (queue.job?.isActive != true) {
-                    queue.job = scope.launch { saveChecklist(queue, s) }
+                    queue.job = scope.launch { saveChecklist(queue, s.session) }
                 }
             },
             onFetchAttachment = { rn ->
@@ -782,7 +795,17 @@ private fun NotesListScreen(
     onRefresh: () -> Unit,
     onCreateNote: () -> Unit,
     onSignOut: () -> Unit,
+    /** A save that failed after the user left the note. */
+    hint: String? = null,
+    onHintShown: () -> Unit = {},
 ) {
+    val snackbarHostState = remember { SnackbarHostState() }
+    LaunchedEffect(hint) {
+        if (hint != null) {
+            snackbarHostState.showSnackbar(hint)
+            onHintShown()
+        }
+    }
     var query by remember { mutableStateOf("") }
     // Notes filtered to the currently-selected folder. null = "All notes"
     // (every folder except trash). TRASH_RECORD_NAME = trash only.
@@ -836,6 +859,7 @@ private fun NotesListScreen(
     ) {
     Scaffold(
         modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             LargeTopAppBar(
                 navigationIcon = {
@@ -1173,6 +1197,7 @@ private fun NoteDetailScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     val shareContext = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
+    val hintScope = rememberCoroutineScope()
     LaunchedEffect(savedHint) {
         if (savedHint != null) {
             snackbarHostState.showSnackbar(savedHint)
@@ -1470,9 +1495,10 @@ private fun NoteDetailScreen(
             // paragraph styling (headings, lists, checkboxes), plain editor
             // otherwise. Tapping the formatted view drops into the editor.
             if (viewMode) {
-                // Where the body starts in the note's full text (after the title line).
-                val bodyOffset = if (fullBodyForSave.contains('\n')) titleDraft.length + 1
-                    else titleDraft.length
+                // Where the body starts in the stored note's text (after the
+                // title line). From the stored text, not the title field: the
+                // save checks offsets against what iCloud has.
+                val bodyOffset = originalBody.indexOf('\n') + 1
                 FormattedNoteBody(
                     fullBody = bodyDraft.text,
                     titlePrefixLength = 0,
@@ -1481,7 +1507,15 @@ private fun NoteDetailScreen(
                     onTap = { if (saving) editRequested = true else viewMode = false },
                     pendingChecks = pendingChecks.mapKeys { it.key - bodyOffset },
                     onToggleCheckbox = { bodyParaStart, checked ->
-                        onToggleCheckbox(bodyParaStart + bodyOffset, checked)
+                        if (titleDraft != initialTitle) {
+                            // Saving the tick swaps in the saved note, which
+                            // would throw the unsaved title away.
+                            hintScope.launch {
+                                snackbarHostState.showSnackbar("Save the title change first, then tick the box.")
+                            }
+                        } else {
+                            onToggleCheckbox(bodyParaStart + bodyOffset, checked)
+                        }
                     },
                     modifier = Modifier
                         .weight(1f)
