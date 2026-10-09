@@ -38,6 +38,10 @@ private const val TAG = "AppleNotesDebug"
  *   LOOKUP_BY_TITLE --es title <substring>  — list, find first match, look it up
  *   APPEND --es recordName <name> --es text <chars>           — append text to a specific record
  *   APPEND_BY_TITLE --es title <sub> --es text <chars>        — list+match+append
+ *   SET_BODY_BY_TITLE --es title <sub> --es body <text> [--ez modDate true]
+ *                                           — splice the body to <text>; modDate also stamps ModificationDate
+ *   PUT_BODY_BY_TITLE --es title <sub> --es b64 <TextDataEncrypted> [--ez modDate true]
+ *                                           — send a body built outside the app, byte for byte
  *
  * Every step logs under the "AppleNotesDebug" tag with a stable prefix so a
  * driver script can pull `adb logcat -s AppleNotesDebug:* AppleNotesClient:* AppleNotesAppender:*`
@@ -151,7 +155,38 @@ class DebugReceiver : BroadcastReceiver() {
                         Log.w(TAG, "SET_BODY_BY_TITLE_NOT_FOUND title='$title'")
                     } else {
                         Log.i(TAG, "SET_BODY_BY_TITLE_FOUND '$title' -> ${match.recordName}")
-                        setBodyOnNote(context, client, match.recordName, body)
+                        setBodyOnNote(
+                            context, client, match.recordName, body,
+                            stampModified = intent.getBooleanExtra("modDate", false),
+                        )
+                    }
+                }
+            }
+            ACTION_PUT_BODY_BY_TITLE -> {
+                val title = intent.getStringExtra("title")
+                val b64 = intent.getStringExtra("b64")
+                if (title == null || b64 == null) {
+                    Log.e(TAG, "PUT_BODY_BY_TITLE missing title or b64")
+                    return
+                }
+                val stampModified = intent.getBooleanExtra("modDate", false)
+                launchOp("PUT_BODY_BY_TITLE") { client, _ ->
+                    val match = findByTitle(client, title)
+                    if (match == null) {
+                        Log.w(TAG, "PUT_BODY_BY_TITLE_NOT_FOUND title='$title'")
+                    } else {
+                        Log.i(TAG, "PUT_BODY_BY_TITLE_FOUND '$title' -> ${match.recordName}")
+                        val record = client.lookupNote(match.recordName)
+                        val body = NoteBodyEditor.readVisibleTextFromBase64(b64).orEmpty()
+                        val (newTitle, newSnippet) = computeTitleAndSnippet(body)
+                        client.modifyNoteBody(
+                            match.recordName, record.recordChangeTag ?: error("no tag"), b64,
+                            newTitle = newTitle,
+                            newSnippet = newSnippet,
+                            replicaVersionPassThroughB64 = record.stringField("ReplicaIDToNotesVersionDataEncrypted"),
+                            modificationDateMs = if (stampModified) System.currentTimeMillis() else null,
+                        )
+                        Log.i(TAG, "PUT_BODY_OK rec=${match.recordName}")
                     }
                 }
             }
@@ -312,6 +347,7 @@ class DebugReceiver : BroadcastReceiver() {
         client: AppleNotesClient,
         recordName: String,
         newBody: String,
+        stampModified: Boolean = false,
     ) {
         val uuid = DeviceIdentity.getOrCreate(context)
         val record = client.lookupNote(recordName)
@@ -334,6 +370,7 @@ class DebugReceiver : BroadcastReceiver() {
             newTitle = newTitle.takeIf { it != oldTitle },
             newSnippet = newSnippet.takeIf { it != oldSnippet },
             replicaVersionPassThroughB64 = record.stringField("ReplicaIDToNotesVersionDataEncrypted"),
+            modificationDateMs = if (stampModified) System.currentTimeMillis() else null,
         )
         Log.i(TAG, "SET_BODY_OK rec=$recordName")
     }
@@ -345,6 +382,7 @@ class DebugReceiver : BroadcastReceiver() {
         private const val ACTION_APPEND = "com.example.applenotes.APPEND"
         private const val ACTION_APPEND_BY_TITLE = "com.example.applenotes.APPEND_BY_TITLE"
         private const val ACTION_SET_BODY_BY_TITLE = "com.example.applenotes.SET_BODY_BY_TITLE"
+        private const val ACTION_PUT_BODY_BY_TITLE = "com.example.applenotes.PUT_BODY_BY_TITLE"
         private const val ACTION_DELETE_BY_TITLE = "com.example.applenotes.DELETE_BY_TITLE"
         private const val ACTION_DUMP_BY_TITLE = "com.example.applenotes.DUMP_BY_TITLE"
         private const val ACTION_DUMP_RECORD = "com.example.applenotes.DUMP_RECORD"

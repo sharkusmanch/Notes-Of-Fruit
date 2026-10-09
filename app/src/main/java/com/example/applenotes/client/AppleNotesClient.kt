@@ -486,6 +486,8 @@ class AppleNotesClient(
         // save then fails with [NoteChangedRemotelyException]. Without it we
         // fall back to resending the caller's bytes under the fresh tag.
         rebase: ((fresh: NoteRecord) -> String?)? = null,
+        // When set, sent as the record's ModificationDate (epoch millis).
+        modificationDateMs: Long? = null,
     ): NoteRecord {
         // Two kinds of rejection are worth another try:
         //
@@ -535,6 +537,12 @@ class AppleNotesClient(
                                     put("SnippetEncrypted", buildJsonObject {
                                         put("type", "ENCRYPTED_STRING")
                                         put("value", kotlin.io.encoding.Base64.encode(newSnippet.encodeToByteArray()))
+                                    })
+                                }
+                                if (modificationDateMs != null) {
+                                    put("ModificationDate", buildJsonObject {
+                                        put("type", "TIMESTAMP")
+                                        put("value", modificationDateMs)
                                     })
                                 }
                                 if (replicaB64 != null) {
