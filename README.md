@@ -187,12 +187,17 @@ Invariants (verified by sampling iCloud.com-created and Mac-created notes):
 ### CRDT semantics in practice
 
 - Each character ever inserted has a globally-unique `(replicaID, clock)` ID.
-  `replicaID=1` is whoever wrote *this* version of the proto; the same UUID may
-  be at a different slot in someone else's proto.
-- **Slot rotation** matters: when iCloud.com edits a note, it always remaps
-  itself to slot 1, demoting everyone else. Mac's notesync uses the rotation as
-  a "refresh local cache" signal. We mirror this in
-  [`NoteAppender.setBodySpliceBytes`](app/src/main/java/com/example/applenotes/proto/NoteAppender.kt).
+  The number is local to one copy of the proto: the same UUID can sit at a
+  different position after another replica joins.
+- **Replica order** matters: `replicaID` is a position in `VectorTimestamp.clock`,
+  and Apple's clients read that list sorted by replica UUID (bytes compared
+  unsigned). A new replica takes its sorted position and every `replicaID` after
+  it shifts up. Written in any other order, Notes on the Mac logs "Topotext text
+  clock is too low", credits each character to the wrong replica and shows the
+  body twice, and iCloud.com drops the edit on its next save. (Earlier versions
+  of this app always put themselves first, which only works when our UUID
+  happens to sort first.) See `placeReplicas` in
+  [`NoteAppender`](app/src/main/java/com/example/applenotes/proto/NoteAppender.kt).
 - `ReplicaIDToNotesVersionDataEncrypted` is the per-replica version vector. Mac
   uses changes to this field as the cache-invalidation signal. Pass it through
   unchanged on modify (don't strip or rewrite). Without this, Mac duplicates the

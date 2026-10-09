@@ -611,7 +611,7 @@ fun AppleNotesApp() {
                             // (one new substring at the sentinel slot). Anything
                             // else (replace/insert/delete in the middle) goes
                             // through the splice path which mirrors iCloud.com's
-                            // pattern: slot promotion + split-and-tombstone +
+                            // pattern: sorted replica list + split-and-tombstone +
                             // fresh ts on tombstones + new chunks for inserts.
                             val newB64 = if (isPureAppend && newSpans == null) {
                                 val appended = newBody.removePrefix(originalBody)

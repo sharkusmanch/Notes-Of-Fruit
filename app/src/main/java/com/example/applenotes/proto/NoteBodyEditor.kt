@@ -272,9 +272,14 @@ object NoteBodyEditor {
         // glyphs for these so they render as `□` placeholder boxes. Translate
         // them to `\n` so the UI shows clean line breaks; this also makes
         // pure-append diffing work normally for users who add lines below.
-        readVisibleTextRaw(noteStoreProtoBytes)
-            ?.replace('\u2028', '\n')
-            ?.replace('\u2029', '\n')
+        readVisibleTextRaw(noteStoreProtoBytes)?.let(::asShown)
+
+    /**
+     * Stored text as the screen shows it. One character in, one character
+     * out, so positions in the result are positions in [stored].
+     */
+    internal fun asShown(stored: String): String =
+        stored.replace('\u2028', '\n').replace('\u2029', '\n')
 
     /**
      * [readVisibleText] without the line-separator translation: the note's

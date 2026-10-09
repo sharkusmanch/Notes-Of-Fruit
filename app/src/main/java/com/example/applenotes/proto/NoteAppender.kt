@@ -281,43 +281,13 @@ object NoteAppender {
             else it.timestampClock
         } ?: 0L
 
-        // ===== Promote ourselves to replica slot 1 =====
-        // iCloud.com's writes always land us at slot 1, demoting every other
-        // replica by one. Mac's notesync uses the slot rotation as the cache-
-        // invalidation signal — without it Mac merges our delta on top of stale
-        // local content and duplicates the body. We rebuild VectorTimestamp's
-        // Clock list (us at front) and rewrite every existing substring's
-        // CharID.replicaID and timestamp.replicaID through the slot remap.
-        // Verified by capturing iCloud.com's resulting proto on a typed note.
+        // ===== Take our place in the replica list =====
+        // Every existing substring's CharID.replicaID and timestamp.replicaID
+        // goes through the remap below.
+        val slots = placeReplicas(vtFields, clocks, ourReplicaUuid)
+        val replicaRemap = slots.remap
 
-        // Build remap: oldSlot -> newSlot.
-        val oldOurSlot = ourClock?.replicaID
-        val replicaRemap = HashMap<Int, Int>()
-        if (oldOurSlot != null) {
-            for (c in clocks) {
-                replicaRemap[c.replicaID] = when {
-                    c.replicaID == oldOurSlot -> 1
-                    c.replicaID < oldOurSlot -> c.replicaID + 1
-                    else -> c.replicaID
-                }
-            }
-        } else {
-            for (c in clocks) replicaRemap[c.replicaID] = c.replicaID + 1
-        }
-
-        // Save each existing Clock entry's bytes by NEW slot so we can rebuild
-        // vtFields in slot order.
-        val savedByNewSlot = HashMap<Int, ProtobufWire.Field>()
-        for (c in clocks) savedByNewSlot[replicaRemap[c.replicaID]!!] = vtFields[c.vtFieldIdx]
-
-        // Strip every Clock entry from vtFields (preserve any non-Clock fields,
-        // which Apple may add in future).
-        vtFields.removeAll {
-            it.fieldNumber == FIELD_VT_CLOCK && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-        }
-
-        // Decide our new clocks. We always end up at slot 1.
-        ourReplicaID = 1
+        ourReplicaID = slots.ours
         // First-allocation clock = max-doc-clock + 1 (matches iCloud.com).
         val freshClockStart = maxOf(maxDocCharIDClock + 1, 0L)
         if (ourClock != null) {
@@ -333,23 +303,10 @@ object NoteAppender {
             isFirstEdit = true
         }
 
-        // Add Clock entries back in new-slot order. Slot 1 = ours; we replace
-        // its bytes below with the bumped counter1/counter2 anyway, but use the
-        // existing entry's bytes if present so subclock + unknown fields survive.
-        ourClockListIdx = vtFields.size
-        if (ourClock != null) {
-            vtFields.add(savedByNewSlot[1]!!) // existing bytes; counters get rewritten below
-        } else {
-            vtFields.add(buildClockEntry(ourReplicaUuid, ourCharIDClock, maxDocTimestampClock))
-        }
-        // Then add slots 2..N in order. Skip slot 1 (just added).
-        val totalSlots = clocks.size + (if (ourClock == null) 1 else 0)
-        for (newSlot in 2..totalSlots) {
-            savedByNewSlot[newSlot]?.let { vtFields.add(it) }
-        }
+        ourClockListIdx = slots.ourListIdx
         Log.i(
             TAG,
-            "promoted ourselves to slot 1: oldSlot=$oldOurSlot remap=$replicaRemap " +
+            "replica slots: ours=${slots.ours} remap=$replicaRemap " +
                 "ourCharIDClock=$ourCharIDClock ourTimestampClock=$ourTimestampClock " +
                 "(maxDocCharID=$maxDocCharIDClock maxDocTimestamp=$maxDocTimestampClock isFirstEdit=$isFirstEdit)",
         )
@@ -579,7 +536,7 @@ object NoteAppender {
      * Splice-based mid-edit. Mirrors iCloud.com's pattern verified by capturing
      * its outgoing proto on a typed-then-edited test note:
      *
-     *  1. Promote ourselves to replica slot 1; demote everyone else by one;
+     *  1. Take our place in the UUID-ordered replica list ([placeReplicas]);
      *     remap every existing substring's CharID.replicaID + timestamp.replicaID.
      *  2. Walk the substring tree to build (visiblePos -> originalSubIdx + offset)
      *     and the chain-order list.
@@ -591,7 +548,7 @@ object NoteAppender {
      *     tombstoned at (R, C0+offset)+(deleteLenInThisSub); the kept right
      *     part is (R, C0+offset+deleteLenInThisSub)+(remainder).
      *  5. Tombstone any substrings that were entirely inside the splice region.
-     *  6. Insert ONE new substring with our (replicaID=1, ourCharIDClock+) and
+     *  6. Insert ONE new substring with our (replicaID, ourCharIDClock+) and
      *     length = insertText.length, content = insertText. Anchor it between
      *     the kept-left and the tombstoned-middle so tree walk sees:
      *        ...prefix... -> NEW -> ...tombstones... -> ...suffix...
@@ -748,7 +705,10 @@ object NoteAppender {
                 visibleToChain.add(Pair(ci, i))
             }
         }
-        val currentVisible = visibleSb.toString()
+        // [newFullBody] is what the screen showed, where a stored soft line
+        // break (U+2028) reads as '\n'. Compare in those terms, or every save
+        // would replace everything between the first and last soft break.
+        val currentVisible = NoteBodyEditor.asShown(visibleSb.toString())
         if (currentVisible == newFullBody && newSpans == null) {
             Log.i(TAG, "setBodySplice: no-op (current visible matches target)")
             return protoBytes
@@ -786,7 +746,7 @@ object NoteAppender {
                 "insertLen=${insertText.length}",
         )
 
-        // ===== Slot promotion: ourselves to slot 1 =====
+        // ===== Take our place in the replica list =====
         val timestampNoteFieldIdx = stringFields.indexOfFirst {
             it.fieldNumber == FIELD_STRING_TIMESTAMP && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
         }
@@ -804,25 +764,9 @@ object NoteAppender {
             else it.timestampClock
         } ?: 0L
 
-        val oldOurSlot = ourClock?.replicaID
-        val replicaRemap = HashMap<Int, Int>()
-        if (oldOurSlot != null) {
-            for (c in clocks) {
-                replicaRemap[c.replicaID] = when {
-                    c.replicaID == oldOurSlot -> 1
-                    c.replicaID < oldOurSlot -> c.replicaID + 1
-                    else -> c.replicaID
-                }
-            }
-        } else {
-            for (c in clocks) replicaRemap[c.replicaID] = c.replicaID + 1
-        }
-        val savedByNewSlot = HashMap<Int, ProtobufWire.Field>()
-        for (c in clocks) savedByNewSlot[replicaRemap[c.replicaID]!!] = vtFields[c.vtFieldIdx]
-        vtFields.removeAll {
-            it.fieldNumber == FIELD_VT_CLOCK && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-        }
-        val ourReplicaID = 1
+        val slots = placeReplicas(vtFields, clocks, ourReplicaUuid)
+        val replicaRemap = slots.remap
+        val ourReplicaID = slots.ours
         val ourCharIDClockStart = if (ourClock != null) {
             require(ourClock.replicaClocks.size == 2)
             maxOf(ourClock.replicaClocks[0].clock, maxDocCharIDClock + 1)
@@ -830,18 +774,7 @@ object NoteAppender {
             maxDocCharIDClock + 1
         }
         val ourTimestampClock = ourClock?.replicaClocks?.get(1)?.clock ?: 0L
-        // Slot 1 entry — placeholder bytes; we rebuild it after we know the
-        // post-edit counter1 (clock + insertText.length).
-        val ourClockListIdx = vtFields.size
-        if (ourClock != null) {
-            vtFields.add(savedByNewSlot[1]!!)
-        } else {
-            vtFields.add(buildClockEntry(ourReplicaUuid, ourCharIDClockStart, maxDocTimestampClock))
-        }
-        val totalSlots = clocks.size + (if (ourClock == null) 1 else 0)
-        for (newSlot in 2..totalSlots) {
-            savedByNewSlot[newSlot]?.let { vtFields.add(it) }
-        }
+        val ourClockListIdx = slots.ourListIdx
 
         // Apply remap to the chain entries' replica IDs.
         for ((i, s) in chain.withIndex()) {
@@ -941,12 +874,12 @@ object NoteAppender {
         // Tombstone every chain entry from rightStartChainIdx up to (but not
         // including) the first entry that begins at visiblePos == deleteTo.
         // CRITICAL: each NEW tombstone gets a FRESH timestamp signed by us
-        // (replicaID=1, fresh ts clock). Mac's notesync compares the substring's
+        // (our replicaID, fresh ts clock). Mac's notesync compares the substring's
         // timestamp to its local view; if the tombstone's ts is the SAME as
         // what Mac's local copy has (i.e., the original Mac ts), Mac decides
         // "this isn't a new event" and ignores the tombstone. Verified by
         // capturing iCloud.com's mid-edit traffic: every new tombstone it
-        // emits has ts=(1, freshClock), where 1 is iCloud.com's slot.
+        // emits has ts=(its replicaID, freshClock).
         var freshTsClock = maxDocTimestampClock + 1
         if (deleteLen > 0) {
             // Re-find rightStartChainIdx after possible second split (indices may have shifted).
@@ -971,7 +904,7 @@ object NoteAppender {
         }
 
         // Insert a NEW entry for insertText, anchored AFTER `insertAfterChainIdx`.
-        // Use our (replicaID=1, ourCharIDClockStart) for the new substring.
+        // Use our (replicaID, ourCharIDClockStart) for the new substring.
         if (insertText.isNotEmpty()) {
             val newEntry = S(
                 origArrayIdx = -1,
@@ -1243,52 +1176,21 @@ object NoteAppender {
         val clocks = parseVectorTimestamp(vtFields)
         val ourClock = clocks.firstOrNull { it.uuid.contentEquals(ourReplicaUuid) }
 
-        // ===== Slot promotion (mirrors iCloud.com's pattern) =====
-        // Promote ourselves to replica slot 1, demote everyone else by one. Mac's
-        // notesync uses the rotation as the cache-invalidation signal — without it
-        // the local cache merges our delta on top of stale state and duplicates
-        // the body.
-        val oldOurSlot = ourClock?.replicaID
-        val replicaRemap = HashMap<Int, Int>()
-        if (oldOurSlot != null) {
-            for (c in clocks) {
-                replicaRemap[c.replicaID] = when {
-                    c.replicaID == oldOurSlot -> 1
-                    c.replicaID < oldOurSlot -> c.replicaID + 1
-                    else -> c.replicaID
-                }
-            }
-        } else {
-            for (c in clocks) replicaRemap[c.replicaID] = c.replicaID + 1
-        }
-        val savedByNewSlot = HashMap<Int, ProtobufWire.Field>()
-        for (c in clocks) savedByNewSlot[replicaRemap[c.replicaID]!!] = vtFields[c.vtFieldIdx]
-        vtFields.removeAll {
-            it.fieldNumber == FIELD_VT_CLOCK && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-        }
-        val ourReplicaID: Int = 1
-        val ourClockListIdx: Int = vtFields.size
+        val slots = placeReplicas(vtFields, clocks, ourReplicaUuid)
+        val replicaRemap = slots.remap
+        val ourReplicaID: Int = slots.ours
+        val ourClockListIdx: Int = slots.ourListIdx
         val isFirstEdit: Boolean
         val ourCharIDClockStart: Long
         if (ourClock != null) {
             isFirstEdit = false
             require(ourClock.replicaClocks.size == 2) { "Clock entry needs 2 ReplicaClocks" }
             ourCharIDClockStart = maxOf(ourClock.replicaClocks[0].clock, maxDocCharIDClock + 1)
-            vtFields.add(savedByNewSlot[1]!!)
         } else {
             isFirstEdit = true
             ourCharIDClockStart = maxDocCharIDClock + 1
-            vtFields.add(buildClockEntry(ourReplicaUuid, ourCharIDClockStart, maxDocTimestampClock))
-            Log.i(TAG, "REWRITE: registered replica + promoted to slot 1")
         }
-        val totalSlots = clocks.size + (if (ourClock == null) 1 else 0)
-        for (newSlot in 2..totalSlots) {
-            savedByNewSlot[newSlot]?.let { vtFields.add(it) }
-        }
-        Log.i(
-            TAG,
-            "REWRITE promoted self to slot 1: oldSlot=$oldOurSlot remap=$replicaRemap"
-        )
+        Log.i(TAG, "REWRITE replica slots: ours=$ourReplicaID remap=$replicaRemap")
 
         // Rewrite all existing substrings' replicaIDs via remap.
         for (subEntry in substrings) {
@@ -1517,6 +1419,62 @@ object NoteAppender {
     )
 
     private data class ParsedReplicaClock(val clock: Long, val subclock: Long)
+
+    private class ReplicaSlots(
+        val remap: Map<Int, Int>, // replicaID before -> replicaID after
+        val ours: Int,
+        val ourListIdx: Int,      // index of our Clock entry in vtFields
+    )
+
+    /**
+     * Rebuilds the Clock list in [vtFields] with our replica in it and says
+     * where every replica ended up.
+     *
+     * A CharID's replicaID is a 1-based position in the Clock list, and
+     * Apple's clients read that list in UUID order (bytes compared unsigned).
+     * Given a list in any other order — ours used to go first — Notes on
+     * the Mac logs "Topotext text clock is too low", credits every character
+     * to the wrong replica and shows the whole body twice, and iCloud.com
+     * drops the edit on its next save. So the list is always written sorted,
+     * which also repairs a note an older build left out of order.
+     *
+     * When we are new to the note our entry is a placeholder; the caller
+     * replaces it once it knows the counters.
+     */
+    private fun placeReplicas(
+        vtFields: MutableList<ProtobufWire.Field>,
+        clocks: List<ParsedClock>,
+        ourReplicaUuid: ByteArray,
+    ): ReplicaSlots {
+        class Entry(val oldReplicaID: Int?, val uuid: ByteArray, val field: ProtobufWire.Field)
+
+        val entries = clocks.map { Entry(it.replicaID, it.uuid, vtFields[it.vtFieldIdx]) }.toMutableList()
+        if (clocks.none { it.uuid.contentEquals(ourReplicaUuid) }) {
+            entries.add(Entry(null, ourReplicaUuid, buildClockEntry(ourReplicaUuid, 0L, 0L)))
+        }
+        entries.sortWith { a, b -> compareUuids(a.uuid, b.uuid) }
+
+        vtFields.removeAll {
+            it.fieldNumber == FIELD_VT_CLOCK && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        val firstClockIdx = vtFields.size
+        val remap = HashMap<Int, Int>()
+        var ours = 0
+        for ((i, e) in entries.withIndex()) {
+            vtFields.add(e.field)
+            if (e.oldReplicaID != null) remap[e.oldReplicaID] = i + 1
+            if (e.uuid.contentEquals(ourReplicaUuid)) ours = i + 1
+        }
+        return ReplicaSlots(remap, ours, firstClockIdx + ours - 1)
+    }
+
+    private fun compareUuids(a: ByteArray, b: ByteArray): Int {
+        for (i in 0 until minOf(a.size, b.size)) {
+            val d = (a[i].toInt() and 0xFF) - (b[i].toInt() and 0xFF)
+            if (d != 0) return d
+        }
+        return a.size - b.size
+    }
 
     private fun parseVectorTimestamp(vtFields: List<ProtobufWire.Field>): List<ParsedClock> {
         val out = mutableListOf<ParsedClock>()
