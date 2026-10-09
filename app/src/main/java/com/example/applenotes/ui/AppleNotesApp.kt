@@ -94,6 +94,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -132,13 +133,22 @@ import com.example.applenotes.auth.ICloudSession
 import com.example.applenotes.auth.USER_AGENT
 import com.example.applenotes.client.AppleNotesClient
 import com.example.applenotes.client.FolderSummary
+import com.example.applenotes.client.NoteChangedRemotelyException
 import com.example.applenotes.client.NoteRecord
+import com.example.applenotes.client.NoteSaveException
 import com.example.applenotes.client.NoteSummary
+import com.example.applenotes.client.SaveErrorKind
+import com.example.applenotes.client.classifySaveError
+import com.example.applenotes.proto.ChecklistToggle
 import com.example.applenotes.proto.NoteAppender
 import com.example.applenotes.proto.NoteBodyEditor
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 private const val TAG = "AppleNotesUi"
 private const val ICLOUD_NOTES_URL = "https://www.icloud.com/notes"
@@ -190,6 +200,25 @@ private sealed interface ScreenState {
 private const val TRASH_RECORD_NAME = "TrashFolder-CloudKit"
 private const val DEFAULT_FOLDER_RECORD_NAME = "DefaultFolder-CloudKit"
 
+/**
+ * Checklist taps on one note that iCloud has not confirmed yet. [pending]
+ * maps the paragraph's start offset in the note's full text to the state the
+ * user wants; the screen draws these on top of the saved note so a box flips
+ * the moment it is tapped. One [job] drains the map, so taps made while a
+ * save is in flight ride along with the next one instead of racing it.
+ */
+private class ChecklistQueue(val recordName: String) {
+    val pending = mutableStateMapOf<Int, Boolean>()
+    var job: Job? = null
+}
+
+private fun saveFailureMessage(e: Throwable): String = when {
+    e is NoteSaveException && classifySaveError(e.code, null) != SaveErrorKind.FATAL ->
+        "Couldn't save — iCloud was busy. Try again."
+    e is java.io.IOException -> "Couldn't save — can't reach iCloud. Try again."
+    else -> "Couldn't save: ${e.message ?: e}"
+}
+
 @Composable
 fun AppleNotesApp() {
     val context = LocalContext.current
@@ -201,7 +230,12 @@ fun AppleNotesApp() {
     }
 
     var state by remember { mutableStateOf<ScreenState>(ScreenState.Splash) }
-    var saving by remember { mutableStateOf(false) }
+    // Saves in flight. Network writes take turns on [saveMutex]: two writes
+    // into the Notes zone at once make iCloud reject one of them.
+    var activeSaves by remember { mutableStateOf(0) }
+    val saving = activeSaves > 0
+    val saveMutex = remember { Mutex() }
+    var checklistQueue by remember { mutableStateOf<ChecklistQueue?>(null) }
     var ourReplicaUuid by remember { mutableStateOf<ByteArray?>(null) }
     var lastSavedHint by remember { mutableStateOf<String?>(null) }
     var lastSavedAtMs by remember { mutableStateOf<Long?>(null) }
@@ -265,6 +299,73 @@ fun AppleNotesApp() {
         AppleNotesClient(httpClient, session).fetchRecents(limit = 1000)
             .filter { !it.deleted }
             .sortedByDescending { it.modificationTimestampMs ?: 0L }
+
+    /** Swap in a newer copy of the note on screen, if it is still on screen. */
+    fun showRecord(record: NoteRecord) {
+        val current = state
+        if (current is ScreenState.Detail && current.record.recordName == record.recordName) {
+            state = current.copy(record = record)
+        }
+    }
+
+    /**
+     * Drain [queue]: write the wanted checklist states to iCloud, one request
+     * at a time, until nothing the user tapped is unsaved. The screen only
+     * moves to the saved note once the queue is empty.
+     */
+    suspend fun saveChecklist(queue: ChecklistQueue, s: ScreenState.Detail) {
+        activeSaves++
+        var record = s.record
+        try {
+            val client = AppleNotesClient(httpClient, s.session)
+            // The offsets in the queue refer to the text of the note on screen.
+            val expectedText = record.stringField("TextDataEncrypted")
+                ?.let { NoteBodyEditor.readVisibleTextFromBase64(it) }
+                ?: error("No body field on this note.")
+            val saved = HashMap<Int, Boolean>()
+            while (true) {
+                val todo = queue.pending.filter { (pos, checked) -> saved[pos] != checked }
+                if (todo.isEmpty()) break
+                val base = record
+                val baseB64 = base.stringField("TextDataEncrypted") ?: error("No body field on this note.")
+                val newB64 = ChecklistToggle.applyBase64(baseB64, expectedText, todo)
+                    ?: throw NoteChangedRemotelyException(base)
+                if (newB64 != baseB64) {
+                    record = saveMutex.withLock {
+                        client.modifyNoteBody(
+                            base.recordName,
+                            base.recordChangeTag ?: error("This note has not been saved yet."),
+                            newB64,
+                            replicaVersionPassThroughB64 = base.stringField("ReplicaIDToNotesVersionDataEncrypted"),
+                            rebase = { fresh ->
+                                fresh.stringField("TextDataEncrypted")
+                                    ?.let { ChecklistToggle.applyBase64(it, expectedText, todo) }
+                            },
+                        )
+                    }
+                }
+                saved.putAll(todo)
+            }
+            queue.pending.clear()
+            showRecord(record)
+            lastSavedAtMs = System.currentTimeMillis()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: NoteChangedRemotelyException) {
+            Log.w(TAG, "checklist save: note changed remotely; showing the fresh copy")
+            queue.pending.clear()
+            showRecord(e.fresh)
+            lastSavedHint = "This note changed on another device. Here is the latest — tap again."
+        } catch (e: Throwable) {
+            Log.e(TAG, "checklist save failed", e)
+            // Drop the unsaved taps so the boxes show what iCloud really has.
+            queue.pending.clear()
+            showRecord(record)
+            lastSavedHint = saveFailureMessage(e)
+        } finally {
+            activeSaves--
+        }
+    }
 
     LaunchedEffect(Unit) {
         // On launch, check for existing session cookies and try to restore.
@@ -403,6 +504,16 @@ fun AppleNotesApp() {
             savedHint = lastSavedHint,
             lastSavedAtMs = lastSavedAtMs,
             onHintShown = { lastSavedHint = null },
+            pendingChecks = checklistQueue?.takeIf { it.recordName == s.record.recordName }?.pending
+                ?: emptyMap(),
+            onToggleCheckbox = { paragraphStart, checked ->
+                val queue = checklistQueue?.takeIf { it.recordName == s.record.recordName }
+                    ?: ChecklistQueue(s.record.recordName).also { checklistQueue = it }
+                queue.pending[paragraphStart] = checked
+                if (queue.job?.isActive != true) {
+                    queue.job = scope.launch { saveChecklist(queue, s) }
+                }
+            },
             onFetchAttachment = { rn ->
                 runCatching {
                     AppleNotesClient(httpClient, s.session).lookupNote(rn)
@@ -419,7 +530,7 @@ fun AppleNotesApp() {
             },
             onSave = { newBody, isPureAppend, alsoExit, newSpans ->
                 scope.launch {
-                    saving = true
+                    activeSaves++
                     try {
                         val uuid = ourReplicaUuid
                             ?: error("Device replica UUID not loaded yet — try again in a moment.")
@@ -455,12 +566,14 @@ fun AppleNotesApp() {
                                 "save (draft→createNote): title='${createTitle.take(30)}' " +
                                     "body.len=${createBody.length} snippet='${newSnippet.take(30)}'",
                             )
-                            updated = client.createNote(
-                                title = createTitle,
-                                body = createBody,
-                                folderRef = folderRef,
-                                ourReplicaUuid = uuid,
-                            )
+                            updated = saveMutex.withLock {
+                                client.createNote(
+                                    title = createTitle,
+                                    body = createBody,
+                                    folderRef = folderRef,
+                                    ourReplicaUuid = uuid,
+                                )
+                            }
                             // Pre-pend a fresh summary into the cache so back-nav
                             // shows the new note immediately without a refetch.
                             val folderRecordName = com.example.applenotes.client.extractReferenceRecordName(folderRef)
@@ -500,14 +613,16 @@ fun AppleNotesApp() {
                                 "save: title '${oldTitle.take(30)}'->'${newTitle.take(30)}' " +
                                     "snippet '${oldSnippet.take(30)}'->'${newSnippet.take(30)}'",
                             )
-                            updated = client.modifyNoteBody(
-                                s.record.recordName,
-                                tag,
-                                newB64,
-                                newTitle = newTitle.takeIf { it != oldTitle },
-                                newSnippet = newSnippet.takeIf { it != oldSnippet },
-                                replicaVersionPassThroughB64 = s.record.stringField("ReplicaIDToNotesVersionDataEncrypted"),
-                            )
+                            updated = saveMutex.withLock {
+                                client.modifyNoteBody(
+                                    s.record.recordName,
+                                    tag,
+                                    newB64,
+                                    newTitle = newTitle.takeIf { it != oldTitle },
+                                    newSnippet = newSnippet.takeIf { it != oldSnippet },
+                                    replicaVersionPassThroughB64 = s.record.stringField("ReplicaIDToNotesVersionDataEncrypted"),
+                                )
+                            }
                             // Patch the cached list summary for this note so when
                             // the user navigates back they see the updated
                             // snippet/title without a refetch.
@@ -548,11 +663,15 @@ fun AppleNotesApp() {
                             else -> current
                         }
                         lastSavedAtMs = System.currentTimeMillis()
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (e: Throwable) {
+                        // Stay on the note: the editor still holds what the
+                        // user typed, and the Save button is still there.
                         Log.e(TAG, "save failed", e)
-                        state = ScreenState.Error(e.message ?: e.toString())
+                        lastSavedHint = saveFailureMessage(e)
                     } finally {
-                        saving = false
+                        activeSaves--
                     }
                 }
             },
@@ -1047,6 +1166,9 @@ private fun NoteDetailScreen(
     onHintShown: () -> Unit = {},
     onFetchAttachment: (suspend (String) -> NoteRecord?)? = null,
     onFetchAsset: (suspend (String) -> ByteArray?)? = null,
+    /** Checklist taps not saved yet: paragraph start in the full note text → wanted state. */
+    pendingChecks: Map<Int, Boolean> = emptyMap(),
+    onToggleCheckbox: (paragraphStart: Int, checked: Boolean) -> Unit = { _, _ -> },
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
     val shareContext = LocalContext.current
@@ -1127,6 +1249,15 @@ private fun NoteDetailScreen(
     }
     var viewMode by remember(record.recordName, record.recordChangeTag) {
         mutableStateOf(hasRichFormatting && initialBody.isNotEmpty())
+    }
+    // A save swaps in the saved record, which resets the editor. So a tap to
+    // start editing while a save is in flight waits for it to land.
+    var editRequested by remember(record.recordName) { mutableStateOf(false) }
+    LaunchedEffect(saving, record.recordChangeTag) {
+        if (!saving && editRequested) {
+            editRequested = false
+            viewMode = false
+        }
     }
 
     // Mutable AttrSpan list driving the editor's formatting state. Covers the
@@ -1226,9 +1357,9 @@ private fun NoteDetailScreen(
 
     // Intercept the system back button / gesture so it navigates to the list
     // instead of closing the activity. Mirrors the back-arrow's behaviour
-    // (save-if-modified, then exit). Disabled while saving so a tap on
-    // "Save" → back doesn't fire twice.
-    androidx.activity.compose.BackHandler(enabled = !saving) {
+    // (save-if-modified, then exit). While a save is in flight this just
+    // goes back to the list; the save finishes in the background.
+    androidx.activity.compose.BackHandler {
         onBackOrSave()
     }
 
@@ -1339,21 +1470,18 @@ private fun NoteDetailScreen(
             // paragraph styling (headings, lists, checkboxes), plain editor
             // otherwise. Tapping the formatted view drops into the editor.
             if (viewMode) {
+                // Where the body starts in the note's full text (after the title line).
+                val bodyOffset = if (fullBodyForSave.contains('\n')) titleDraft.length + 1
+                    else titleDraft.length
                 FormattedNoteBody(
                     fullBody = bodyDraft.text,
                     titlePrefixLength = 0,
                     attrSpans = bodyAttrSpans,
                     attachmentContent = attachmentCache.value,
-                    onTap = { viewMode = false },
-                    onToggleCheckbox = { bodyParaStart ->
-                        val skip = if (fullBodyForSave.contains('\n')) titleDraft.length + 1
-                            else titleDraft.length
-                        val fullPos = bodyParaStart + skip
-                        spansDraft = NoteBodyEditor.toggleCheckbox(
-                            fullBodyForSave, spansDraft, fullPos,
-                        )
-                        // Auto-save the toggle so check state persists.
-                        onSave(fullBodyForSave, false, false, spansDraft)
+                    onTap = { if (saving) editRequested = true else viewMode = false },
+                    pendingChecks = pendingChecks.mapKeys { it.key - bodyOffset },
+                    onToggleCheckbox = { bodyParaStart, checked ->
+                        onToggleCheckbox(bodyParaStart + bodyOffset, checked)
                     },
                     modifier = Modifier
                         .weight(1f)
@@ -1581,7 +1709,9 @@ private fun FormattedNoteBody(
     attrSpans: List<NoteBodyEditor.AttrSpan>,
     attachmentContent: Map<String, AttachmentContent> = emptyMap(),
     onTap: () -> Unit,
-    onToggleCheckbox: ((paragraphCharStart: Int) -> Unit)? = null,
+    /** Checklist taps not saved yet: paragraph start in [fullBody] → wanted state. */
+    pendingChecks: Map<Int, Boolean> = emptyMap(),
+    onToggleCheckbox: ((paragraphCharStart: Int, checked: Boolean) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     // Map each char index -> (style, checked). Walk attrSpans in order and
@@ -1714,7 +1844,7 @@ private fun FormattedNoteBody(
                     BulletRow("–", annotated)
                 }
                 NoteBodyEditor.ParagraphStyle.CHECKBOX_LIST -> {
-                    val checked = firstSpan?.checked ?: false
+                    val checked = pendingChecks[range.first] ?: (firstSpan?.checked ?: false)
                     Row(verticalAlignment = Alignment.Top) {
                         Icon(
                             if (checked) Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,
@@ -1726,7 +1856,7 @@ private fun FormattedNoteBody(
                                 .size(28.dp)
                                 .clip(RoundedCornerShape(6.dp))
                                 .clickable(enabled = onToggleCheckbox != null) {
-                                    onToggleCheckbox?.invoke(range.first)
+                                    onToggleCheckbox?.invoke(range.first, !checked)
                                 },
                         )
                         Text(

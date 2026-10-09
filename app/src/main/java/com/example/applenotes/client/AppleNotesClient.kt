@@ -17,6 +17,7 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.contentType
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
+import kotlinx.coroutines.delay
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
@@ -63,6 +64,20 @@ data class NoteRecord(
     fun stringField(name: String): String? = rawFields[name]?.let { extractStringValue(it) }
     fun decodedTitle(): String? = rawFields["TitleEncrypted"]?.let { decodeEncryptedString(it) }
 }
+
+/** A save iCloud rejected, after any retries. [code] is CloudKit's `serverErrorCode`. */
+class NoteSaveException(val code: String, reason: String?) :
+    Exception("modifyNoteBody per-record error: $code reason=${reason ?: "?"}")
+
+/**
+ * The note changed on another device in a way our edit could not be reapplied
+ * to. [fresh] is the note as iCloud has it now.
+ */
+class NoteChangedRemotelyException(val fresh: NoteRecord) :
+    Exception("The note changed on another device")
+
+private const val MAX_BUSY_RETRIES = 4
+private const val MAX_REBASE_RETRIES = 3
 
 /**
  * Minimal CloudKit JSON client for `com.apple.notes` (private DB). Mirrors the
@@ -465,23 +480,35 @@ class AppleNotesClient(
         // Without it, Mac's local cache can diverge from iCloud (we observed
         // duplication after Android append on multi-substring typed notes).
         replicaVersionPassThroughB64: String? = null,
+        // Rebuilds the body on top of the note as iCloud has it now, for when
+        // the record changed under us (CONFLICT). Returns the new
+        // TextDataEncrypted, or null when the edit no longer applies — the
+        // save then fails with [NoteChangedRemotelyException]. Without it we
+        // fall back to resending the caller's bytes under the fresh tag.
+        rebase: ((fresh: NoteRecord) -> String?)? = null,
     ): NoteRecord {
-        // Try once with the caller's tag; on CONFLICT (oplock — Mac's
-        // notesync silently bumped the tag after merging the previous
-        // op) re-lookup to get a fresh tag + replicaVersion, then retry
-        // once more. Two attempts max so we never loop on a real bug.
+        // Two kinds of rejection are worth another try:
         //
-        // KNOWN LIMITATION: this retry refreshes only the tag, not the
-        // base body. If a real concurrent edit happened between the
-        // caller's base lookup and this retry, we'll overwrite it with
-        // bytes computed against the stale base (last-writer-wins).
-        // The dominant case we hit is post-create housekeeping where
-        // Mac bumps the tag without changing user-visible text, which
-        // is safe. A proper fix is to bubble the conflict to the
-        // splice caller so it can re-splice against the fresh base.
+        //  - ZONE_BUSY (TRY_AGAIN_LATER "Sync zone CAS Op-Lock failed"):
+        //    another write landed in the zone while ours was in flight. The
+        //    request itself is fine, so wait a moment and send it again.
+        //  - RECORD_CONFLICT (CONFLICT "client oplock error"): the record's
+        //    tag moved on. Re-lookup for a fresh tag + replicaVersion and,
+        //    when the caller gave us [rebase], rebuild the body on the fresh
+        //    copy.
+        //
+        // KNOWN LIMITATION without [rebase]: the retry refreshes only the
+        // tag, not the base body. If a real concurrent edit happened between
+        // the caller's base lookup and this retry, we'll overwrite it with
+        // bytes computed against the stale base (last-writer-wins). The
+        // dominant case we hit is post-create housekeeping where Mac bumps
+        // the tag without changing user-visible text, which is safe.
         var attempt = 0
+        var busyRetries = 0
+        var conflictRetries = 0
         var tag = recordChangeTag
         var replicaB64 = replicaVersionPassThroughB64
+        var bodyB64 = newTextDataEncryptedB64
         while (true) {
             attempt++
             val payload: JsonObject = buildJsonObject {
@@ -496,7 +523,7 @@ class AppleNotesClient(
                             put("fields", buildJsonObject {
                                 put("TextDataEncrypted", buildJsonObject {
                                     put("type", "ENCRYPTED_BYTES")
-                                    put("value", newTextDataEncryptedB64)
+                                    put("value", bodyB64)
                                 })
                                 if (newTitle != null) {
                                     put("TitleEncrypted", buildJsonObject {
@@ -523,11 +550,11 @@ class AppleNotesClient(
             }
             Log.i(
                 TAG,
-                "modifyNoteBody[a$attempt]: rec=$recordName tag=$tag b64.len=${newTextDataEncryptedB64.length} " +
+                "modifyNoteBody[a$attempt]: rec=$recordName tag=$tag b64.len=${bodyB64.length} " +
                     "title=${newTitle?.let { "'${it.take(40)}'" } ?: "<unchanged>"} " +
                     "snippet=${newSnippet?.let { "'${it.take(40)}'" } ?: "<unchanged>"}",
             )
-            Log.i(TAG, "modifyNoteBody SENT proto: ${NoteBodyEditor.summarizeBase64(newTextDataEncryptedB64)}")
+            Log.i(TAG, "modifyNoteBody SENT proto: ${NoteBodyEditor.summarizeBase64(bodyB64)}")
             val t0 = System.currentTimeMillis()
             val (status, raw) = postJson("/records/modify", payload)
             val elapsed = System.currentTimeMillis() - t0
@@ -541,23 +568,36 @@ class AppleNotesClient(
             val rec = parsed.records?.firstOrNull() ?: error("records/modify returned no record")
             val serverErr = rec.serverErrorCode
             if (serverErr != null) {
-                val isConflict = serverErr == "CONFLICT" ||
-                    (rec.reason?.contains("oplock", ignoreCase = true) == true)
-                if (isConflict && attempt == 1) {
+                val kind = classifySaveError(serverErr, rec.reason)
+                if (kind == SaveErrorKind.ZONE_BUSY && busyRetries < MAX_BUSY_RETRIES) {
+                    busyRetries++
+                    val waitMs = retryDelayMs(busyRetries, rec.retryAfter)
+                    Log.w(TAG, "modifyNoteBody $serverErr — zone busy, retry $busyRetries in ${waitMs}ms. reason=${rec.reason}")
+                    delay(waitMs)
+                    continue
+                }
+                val maxConflictRetries = if (rebase != null) MAX_REBASE_RETRIES else 1
+                if (kind == SaveErrorKind.RECORD_CONFLICT && conflictRetries < maxConflictRetries) {
+                    conflictRetries++
                     Log.w(TAG, "modifyNoteBody CONFLICT (oplock) — refetching tag and retrying. reason=${rec.reason}")
                     val fresh = lookupNote(recordName)
                     val newTag = fresh.recordChangeTag
                         ?: error("modifyNoteBody refetch returned no recordChangeTag for $recordName")
+                    if (rebase != null) {
+                        bodyB64 = rebase(fresh) ?: throw NoteChangedRemotelyException(fresh)
+                        // The other device already made the same change.
+                        if (bodyB64 == fresh.stringField("TextDataEncrypted")) return fresh
+                    }
                     tag = newTag
                     replicaB64 = fresh.stringField("ReplicaIDToNotesVersionDataEncrypted") ?: replicaB64
-                    Log.i(TAG, "modifyNoteBody retry with fresh tag=$tag")
+                    Log.i(TAG, "modifyNoteBody retry with fresh tag=$tag rebased=${rebase != null}")
                     continue
                 }
                 Log.e(TAG, "modifyNoteBody per-record error: $serverErr reason=${rec.reason}")
-                error("modifyNoteBody per-record error: $serverErr reason=${rec.reason ?: "?"}")
+                throw NoteSaveException(serverErr, rec.reason)
             }
             // Success — fall through to record handling below.
-            return finishModifyNoteBody(recordName, rec, newTextDataEncryptedB64)
+            return finishModifyNoteBody(recordName, rec, bodyB64)
         }
     }
 
@@ -723,4 +763,6 @@ private data class RecordSummary(
     val modified: JsonElement? = null,
     val serverErrorCode: String? = null,
     val reason: String? = null,
+    /** Seconds the server asks us to wait before retrying; sent with TRY_AGAIN_LATER / THROTTLED. */
+    val retryAfter: Double? = null,
 )

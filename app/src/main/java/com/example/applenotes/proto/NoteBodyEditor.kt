@@ -265,7 +265,22 @@ object NoteBodyEditor {
      *
      * Returns null if the proto isn't shaped like NoteStoreProto/topotext.
      */
-    fun readVisibleText(noteStoreProtoBytes: ByteArray): String? = runCatching {
+    fun readVisibleText(noteStoreProtoBytes: ByteArray): String? =
+        // Apple Notes stores Shift-Enter / soft line breaks as U+2028 (LINE
+        // SEPARATOR) and paragraph separators as U+2029 — same byte sequence
+        // Mac and iCloud render as a line break. Android's default fonts lack
+        // glyphs for these so they render as `□` placeholder boxes. Translate
+        // them to `\n` so the UI shows clean line breaks; this also makes
+        // pure-append diffing work normally for users who add lines below.
+        readVisibleTextRaw(noteStoreProtoBytes)
+            ?.replace('\u2028', '\n')
+            ?.replace('\u2029', '\n')
+
+    /**
+     * [readVisibleText] without the line-separator translation: the note's
+     * characters exactly as stored, one for one with the attribute runs.
+     */
+    internal fun readVisibleTextRaw(noteStoreProtoBytes: ByteArray): String? = runCatching {
         val top = ProtobufWire.decode(noteStoreProtoBytes)
         val docField = top.firstOrNull {
             it.fieldNumber == FIELD_NOTESTOREPROTO_DOCUMENT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
@@ -359,15 +374,7 @@ object NoteBodyEditor {
             }
             cur = s.children.firstOrNull() ?: break
         }
-        // Apple Notes stores Shift-Enter / soft line breaks as U+2028 (LINE
-        // SEPARATOR) and paragraph separators as U+2029 — same byte sequence
-        // Mac and iCloud render as a line break. Android's default fonts lack
-        // glyphs for these so they render as `□` placeholder boxes. Translate
-        // them to `\n` so the UI shows clean line breaks; this also makes
-        // pure-append diffing work normally for users who add lines below.
         out.toString()
-            .replace(' ', '\n')
-            .replace(' ', '\n')
     }.getOrNull()
 
     fun readVisibleTextFromBase64(textDataEncryptedB64: String): String? {
