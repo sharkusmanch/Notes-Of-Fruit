@@ -321,21 +321,22 @@ These were dead ends; documenting so you don't repeat them.
 | Share OUT | Detail screen → share button → Android chooser appears |
 | Folder filter | Drawer → select folder → list filters; trash hidden by default |
 
-The `DebugReceiver` exposes the same code paths via `adb` broadcasts:
+The `DebugReceiver` exposes the same code paths via `adb` broadcasts (debug
+builds only — release builds do not contain it):
 
 ```bash
 # List all notes
-adb shell am broadcast -p com.example.applenotes -a com.example.applenotes.LIST
+adb shell am broadcast -p io.github.sharkusmanch.notesoffruit -a com.example.applenotes.LIST
 
 # Look up a specific note by title
-adb shell am broadcast -p com.example.applenotes -a com.example.applenotes.LOOKUP_BY_TITLE --es title 'foo'
+adb shell am broadcast -p io.github.sharkusmanch.notesoffruit -a com.example.applenotes.LOOKUP_BY_TITLE --es title 'foo'
 
 # Append to an existing note
-adb shell am broadcast -p com.example.applenotes -a com.example.applenotes.APPEND_BY_TITLE \
+adb shell am broadcast -p io.github.sharkusmanch.notesoffruit -a com.example.applenotes.APPEND_BY_TITLE \
   --es title 'foo' --es text 'extra line'
 
 # Create a new note
-adb shell am broadcast -p com.example.applenotes -a com.example.applenotes.CREATE \
+adb shell am broadcast -p io.github.sharkusmanch.notesoffruit -a com.example.applenotes.CREATE \
   --es title 'newnote' --es body 'hello'
 ```
 
@@ -369,7 +370,7 @@ Read order if you're new:
 ```bash
 ./gradlew :app:assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
-adb shell am start -n com.example.applenotes/.MainActivity
+adb shell am start -n io.github.sharkusmanch.notesoffruit/com.example.applenotes.MainActivity
 ```
 
 You'll need an Android emulator or device with Google Play Services. Sign in

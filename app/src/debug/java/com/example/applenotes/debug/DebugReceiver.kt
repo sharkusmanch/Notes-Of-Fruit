@@ -28,7 +28,9 @@ private const val TAG = "AppleNotesDebug"
  * through the UI.
  *
  * Triggered by:
- *   adb shell am broadcast -p com.example.applenotes -a com.example.applenotes.<ACTION> [extras...]
+ *   adb shell am broadcast -p io.github.sharkusmanch.notesoffruit -a com.example.applenotes.<ACTION> [extras...]
+ *
+ * Compiled into debug builds only (this file lives in src/debug).
  *
  * Actions:
  *   LIST                                    — fetchRecents, log every note
